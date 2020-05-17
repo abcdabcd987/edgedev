@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 # Adapted from https://github.com/satcar77/miband4
 
-import sys
+import dataclasses
+import logging
 import os
+import signal
+import sys
 import struct
 import time
-import logging
 from datetime import datetime, timedelta
+from typing import *  # pylint: disable=unused-wildcard-import
 
+import dotenv
+import requests
 from bluepy.btle import (
     Peripheral,
     DefaultDelegate,
@@ -67,6 +72,15 @@ class AUTH_STATES:
     REQUEST_RN_ERROR = "Something went wrong when requesting the random number"
 
 
+@dataclasses.dataclass
+class ActivityEntry:
+    time: datetime
+    category: int
+    intensity: int
+    steps: int
+    heart_rate: Optional[int]
+
+
 class MiBandDelegate(DefaultDelegate):
     def __init__(self, device):
         super().__init__()
@@ -75,7 +89,7 @@ class MiBandDelegate(DefaultDelegate):
         self.pkg = 0
 
     def handleNotification(self, hnd, data):
-        self._log.debug(f'Notification. hnd: {hnd}. data: {data}')
+        self._log.debug(f"Notification. hnd: {hnd}. data: {data}")
         if hnd == self.device._char_auth.getHandle():
             if data[:3] == b"\x10\x01\x01":
                 self.device._req_rdn()
@@ -104,28 +118,23 @@ class MiBandDelegate(DefaultDelegate):
                 minute = struct.unpack("b", data[12:13])[0]
                 self.device.first_timestamp = datetime(year, month, day, hour, minute)
                 self._log.info(
-                    "Fetch data from %d-%d-%d %d:%d", year, month, day, hour, minute
+                    "Receiving data from %d-%02d-%02d %02d:%02d",
+                    year,
+                    month,
+                    day,
+                    hour,
+                    minute,
                 )
                 self.pkg = 0  # reset the packing index
                 self.device._char_fetch.write(b"\x02", False)
             elif data[:3] == b"\x10\x02\x01":
-                timestamp_diff = self.device.end_timestamp - self.device.last_timestamp
-                if timedelta(minutes=1) > timestamp_diff:
-                    self._log.info("Finished fetching")
-                    return
-                self._log.info("Trigger more communication")
-                time.sleep(1)
-                t = self.device.last_timestamp + timedelta(minutes=1)
-                self.device.start_get_previews_data(t)
-
+                self._log.info("Finished fetching")
+                self.device.activity_ctx.ready = True
             elif data[:3] == b"\x10\x02\x04":
-                self._log.info("No more activity fetch possible")
-                return
+                self._log.info("No more activity to fetch")
+                self.device.activity_ctx.ready = True
             else:
-                self._log.info(
-                    "Unexpected data on handle " + str(hnd) + ": " + str(data)
-                )
-                return
+                self._log.info(f"Unexpected data on handle {hnd}: {data}")
         elif hnd == self.device._char_activity.getHandle():
             if len(data) % 4 == 1:
                 self.pkg += 1
@@ -138,10 +147,14 @@ class MiBandDelegate(DefaultDelegate):
                     intensity = struct.unpack("B", data[i + 1 : i + 2])[0]
                     steps = struct.unpack("B", data[i + 2 : i + 3])[0]
                     heart_rate = struct.unpack("B", data[i + 3 : i + 4])[0]
-                    if timestamp < self.device.end_timestamp:
-                        self.device.activity_callback(
-                            timestamp, category, intensity, steps, heart_rate
-                        )
+                    entry = ActivityEntry(
+                        timestamp,
+                        category,
+                        intensity,
+                        steps,
+                        None if heart_rate == 255 else heart_rate,
+                    )
+                    self.device.activity_ctx.activities.append(entry)
                     i += 4
             else:
                 self._log.warning(f"len(data) % 4 != 1. len(data) = {len(data)}")
@@ -149,60 +162,45 @@ class MiBandDelegate(DefaultDelegate):
             self._log.warning(f"Unknown handle: {hnd}")
 
 
-class MiBand(Peripheral):
-    _send_rnd_cmd = struct.pack("<2s", b"\x02\x00")
-    _send_enc_key = struct.pack("<2s", b"\x03\x00")
+class MiBand4Device(Peripheral):
+    @dataclasses.dataclass
+    class ActivityContext:
+        ready: bool
+        activities: List[ActivityEntry]
 
-    def __init__(self, mac_address, key, timeout=0.5):
+    def __init__(self, mac_address, key):
         self._log = logging.getLogger(self.__class__.__name__)
         self._log.info("Connecting to " + mac_address)
         super().__init__(mac_address, addrType=ADDR_TYPE_PUBLIC)
         self._log.info("Connected")
-        if not key:
-            self.setSecurityLevel(level="medium")
-        self.timeout = timeout
         self.mac_address = mac_address
         self.state = None
-        self.heart_measure_callback = None
-        self.heart_raw_callback = None
-        self.accel_raw_callback = None
         self.auth_key = key
+
+        # fmt: off
         self.svc_1 = self.getServiceByUUID(UUIDS.SERVICE_MIBAND1)
         self.svc_2 = self.getServiceByUUID(UUIDS.SERVICE_MIBAND2)
-
         self._char_auth = self.svc_2.getCharacteristics(UUIDS.CHARACTERISTIC_AUTH)[0]
-        self._desc_auth = self._char_auth.getDescriptors(
-            forUUID=UUIDS.NOTIFICATION_DESCRIPTOR
-        )[0]
-
-        # Recorded information
+        self._desc_auth = self._char_auth.getDescriptors(UUIDS.NOTIFICATION_DESCRIPTOR)[0]
         self._char_fetch = self.getCharacteristics(uuid=UUIDS.CHARACTERISTIC_FETCH)[0]
-        self._desc_fetch = self._char_fetch.getDescriptors(
-            forUUID=UUIDS.NOTIFICATION_DESCRIPTOR
-        )[0]
-        self._char_activity = self.getCharacteristics(
-            uuid=UUIDS.CHARACTERISTIC_ACTIVITY_DATA
-        )[0]
-        self._desc_activity = self._char_activity.getDescriptors(
-            forUUID=UUIDS.NOTIFICATION_DESCRIPTOR
-        )[0]
+        self._desc_fetch = self._char_fetch.getDescriptors(UUIDS.NOTIFICATION_DESCRIPTOR)[0]
+        self._char_activity = self.getCharacteristics(uuid=UUIDS.CHARACTERISTIC_ACTIVITY_DATA)[0]
+        self._desc_activity = self._char_activity.getDescriptors(UUIDS.NOTIFICATION_DESCRIPTOR)[0]
+        # fmt: on
 
         self._auth_notif(True)
         self.activity_notif_enabled = False
         self.waitForNotifications(0.1)
-        self.setDelegate(MiBandDelegate(self))
+        self.withDelegate(MiBandDelegate(self))
+        self.activity_ctx = self.ActivityContext(False, [])
 
-    def _auth_notif(self, enabled):
+    def _auth_notif(self, enabled: bool):
         if enabled:
             self._log.info("Enabling Auth Service notifications status...")
             self._desc_auth.write(b"\x01\x00", True)
-        elif not enabled:
+        else:
             self._log.info("Disabling Auth Service notifications status...")
             self._desc_auth.write(b"\x00\x00", True)
-        else:
-            self._log.error(
-                "Something went wrong while changing the Auth Service notifications status..."
-            )
 
     def _auth_previews_data_notif(self, enabled):
         if enabled:
@@ -219,6 +217,7 @@ class MiBand(Peripheral):
             self.activity_notif_enabled = False
 
     def initialize(self):
+        self._log.info("Initializing")
         self._req_rdn()
 
         while True:
@@ -235,45 +234,21 @@ class MiBand(Peripheral):
 
     def _req_rdn(self):
         self._log.info("Requesting random number...")
-        self._char_auth.write(self._send_rnd_cmd)
-        self.waitForNotifications(self.timeout)
+        send_rnd_cmd = struct.pack("<2s", b"\x02\x00")
+        self._char_auth.write(send_rnd_cmd)
+        self.waitForNotifications(0.1)
 
     def _send_enc_rdn(self, data):
         self._log.info("Sending encrypted random number")
-        cmd = self._send_enc_key + self._encrypt(data)
+        send_enc_key = struct.pack("<2s", b"\x03\x00")
+        cmd = send_enc_key + self._encrypt(data)
         send_cmd = struct.pack("<18s", cmd)
         self._char_auth.write(send_cmd)
-        self.waitForNotifications(self.timeout)
+        self.waitForNotifications(0.1)
 
     def _encrypt(self, message):
         aes = AES.new(self.auth_key, AES.MODE_ECB)
         return aes.encrypt(message)
-
-    def send_custom_alert(self, type, phone):
-        if type == 5:
-            base_value = "\x05\x01"
-        elif type == 4:
-            base_value = "\x04\x01"
-        elif type == 3:
-            base_value = "\x03\x01"
-        svc = self.getServiceByUUID(UUIDS.SERVICE_ALERT_NOTIFICATION)
-        char = svc.getCharacteristics(UUIDS.CHARACTERISTIC_CUSTOM_ALERT)[0]
-        char.write(bytes(base_value + phone, "utf-8"), withResponse=True)
-
-    def get_steps(self):
-        char = self.svc_1.getCharacteristics(UUIDS.CHARACTERISTIC_STEPS)[0]
-        a = char.read()
-        steps = struct.unpack("h", a[1:3])[0] if len(a) >= 3 else None
-        meters = struct.unpack("h", a[5:7])[0] if len(a) >= 7 else None
-        fat_burned = struct.unpack("h", a[2:4])[0] if len(a) >= 4 else None
-        # why only 1 byte??
-        calories = struct.unpack("b", a[9:10])[0] if len(a) >= 10 else None
-        return {
-            "steps": steps,
-            "meters": meters,
-            "fat_burned": fat_burned,
-            "calories": calories,
-        }
 
     @staticmethod
     def _parse_date(bytes):
@@ -323,19 +298,19 @@ class MiBand(Peripheral):
         }
         return res
 
-    def get_battery_info(self):
+    def GetBattery(self) -> int:
         char = self.svc_1.getCharacteristics(UUIDS.CHARACTERISTIC_BATTERY)[0]
-        return self._parse_battery_response(char.read())
+        return self._parse_battery_response(char.read())["level"]
 
-    def get_current_time(self):
+    def GetCurrentTime(self) -> datetime:
         char = self.svc_1.getCharacteristics(UUIDS.CHARACTERISTIC_CURRENT_TIME)[0]
-        return self._parse_date(char.read()[0:9])
+        return self._parse_date(char.read()[0:9])["date"]
 
-    def set_current_time(self, date):
+    def SetCurrentTime(self, date):
         char = self.svc_1.getCharacteristics(UUIDS.CHARACTERISTIC_CURRENT_TIME)[0]
         return char.write(self.create_date_data(date), True)
 
-    def start_get_previews_data(self, start_timestamp):
+    def _start_get_activities(self, start_timestamp: datetime):
         if not self.activity_notif_enabled:
             self._auth_previews_data_notif(True)
             self.waitForNotifications(0.1)
@@ -348,46 +323,179 @@ class MiBand(Peripheral):
         ts = year + month + day + hour + minute
         trigger = b"\x01\x01" + ts + b"\x00\x17"
         self._char_fetch.write(trigger, False)
-        self.active = True
 
-    def get_activity_betwn_intervals(self, start_timestamp, end_timestamp, callback):
-        self.end_timestamp = end_timestamp
-        self.start_get_previews_data(start_timestamp)
-        self.activity_callback = callback
+    def _get_activities_batch(self, start_timestamp: datetime):
+        self.activity_ctx.ready = False
+        self.activity_ctx.activities.clear()
+        self._start_get_activities(start_timestamp)
+        st = datetime.now()
+        while not self.activity_ctx.ready:
+            self.waitForNotifications(0.1)
+            if datetime.now() - st > timedelta(seconds=30):
+                self._log.warning("GetActivities timed out")
+                break
+
+    def GetActivities(self, start_timestamp: datetime) -> List[ActivityEntry]:
+        now = datetime.now()
+        start = start_timestamp
+        activities: List[ActivityEntry] = []
+
+        while now - start > timedelta(minutes=5):
+            self._log.info(f"Requesting data from {start:%Y-%m-%d %H:%M}")
+            try:
+                self._get_activities_batch(start)
+            except BTLEDisconnectError:
+                self._log("Device disconnected unexpectly")
+                break
+
+            xs = self.activity_ctx.activities
+            xs.sort(key=lambda x: x.time)
+            cnt_stale = next(
+                filter(lambda i: xs[i].time >= start, range(len(xs))), len(xs)
+            )
+            activities += xs[cnt_stale:]
+            self._log.info(
+                "Got new %d activity logs and %d stales ones.",
+                len(xs) - cnt_stale,
+                cnt_stale,
+            )
+            if len(xs) == cnt_stale:
+                start = activities[-1].time + timedelta(days=1)
+            else:
+                start = activities[-1].time + timedelta(minutes=1)
+        self._log.info(f"Got {len(activities)} activity logs in total.")
+        return activities
 
 
-def activity_log_callback(timestamp, c, i, s, h):
-    print(
-        "{}: category: {}; intensity {}; steps {}; heart rate {};".format(
-            timestamp.strftime("%Y-%m-%d %H:%M:%S"), c, i, s, h
-        )
-    )
+class MiBand4:
+    def __init__(
+        self,
+        *,
+        mac_addr: str,
+        auth_key: str,
+        success_interval: int,
+        failure_interval: int,
+        dbhost: str,
+        dbuser: str,
+        dbpass: str,
+        dbname: str,
+        dbtable_activity: str,
+        dbtable_device: str,
+    ):
+        self._log = logging.getLogger(self.__class__.__name__)
+        if len(mac_addr) != 17:
+            self._log.critical(
+                "Incorrect format of MAC address (%s). Example: %s",
+                mac_addr,
+                "a1:c2:3d:4e:f5:6a",
+            )
+            exit(1)
+        if len(auth_key) != 32:
+            self._log.critical(
+                "Incorrect format of AUTH_KEY (%s). Example: %s",
+                auth_key,
+                "8fa9b42078627a654d22beff985655db",
+            )
+            exit(1)
+        self._mac_addr = mac_addr
+        self._auth_key = bytes.fromhex(auth_key)
+        self._success_interval = success_interval
+        self._failure_interval = failure_interval
+        self._dbtable_activity = dbtable_activity
+        self._dbtable_device = dbtable_device
+
+        self._url = f"{dbhost}/api/v2/write?bucket={dbname}&precision=s"
+        self._session = requests.Session()
+        self._session.headers["Authorization"] = f"Token {dbuser}:{dbpass}"
+
+        url = f"{dbhost}/query?db={dbname}&epoch=s"
+        query = f"SELECT * FROM {dbtable_activity} ORDER BY time DESC LIMIT 1"
+        ret = self._session.get(url, params=dict(q=query)).json()
+        try:
+            timestamp = ret["results"][0]["series"][0]["values"][0][0]
+            self._last_time = datetime.fromtimestamp(timestamp)
+        except KeyError:
+            self._last_time = datetime(2020, 1, 1)
+        self._log.info(f"Setting last_time to {self._last_time:%Y-%m-%d %H:%M:%S}")
+
+    def _collect(self) -> str:
+        ok = False
+        while not ok:
+            band = MiBand4Device(self._mac_addr, self._auth_key)
+            ok = band.initialize()
+
+        activities = band.GetActivities(self._last_time)
+        battery = band.GetBattery()
+        now = datetime.now()
+        current_time = band.GetCurrentTime()
+        drift = (current_time - now).total_seconds()
+        band.disconnect()
+        self._log.info("Bluetooth disconnected.")
+
+        if activities:
+            self._last_time = activities[-1].time
+
+        data = []
+        for entry in activities:
+            line = f"{self._dbtable_activity} category={entry.category},intensity={entry.intensity},steps={entry.steps}"
+            if entry.heart_rate is not None:
+                line += f",heart_rate={entry.heart_rate}"
+            line += f" {int(entry.time.timestamp())}"
+            data.append(line)
+        line = f"{self._dbtable_device} battery={battery},clock_drift={drift} {int(now.timestamp())}"
+        data.append(line)
+        return "\n".join(data)
+
+    def _report(self) -> bool:
+        try:
+            data = self._collect()
+        except BTLEDisconnectError:
+            self._log.info(f"Cannot talk to the device.")
+            return False
+
+        r = self._session.post(self._url, data=data)
+        try:
+            r.raise_for_status()
+            self._log.info(f"Succeeded.")
+            return True
+        except requests.exceptions.HTTPError as e:
+            self._log.error(e)
+            return False
+
+    def Run(self):
+        try:
+            while True:
+                ok = self._report()
+                sleep = self._success_interval if ok else self._failure_interval
+                self._log.info(f"Sleep for {sleep} seconds")
+                time.sleep(sleep)
+        except KeyboardInterrupt:
+            self._log.info("Exiting...")
 
 
 def main():
-    logging.basicConfig(level=logging.DEBUG)
-
-    mac_addr = "e6:26:7c:a8:f5:a1"
-    auth_key = bytes.fromhex("6ba1b8cb20edb2a2ba8498f85a954198")
-
-    ok = False
-    while not ok:
-        try:
-            band = MiBand(mac_addr, auth_key)
-            ok = band.initialize()
-        except BTLEDisconnectError:
-            print("Connection to the MIBand failed. Trying out again in 3 seconds")
-            time.sleep(3)
-        except KeyboardInterrupt:
-            print("\nExit.")
-            exit()
-
-    temp = datetime.now()
-    band.get_activity_betwn_intervals(
-        datetime(temp.year, temp.month, temp.day), datetime.now(), activity_log_callback
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)-8s %(filename)s:%(lineno)-4d] %(message)s",
+        datefmt="%Y-%m-%d %H:%M%S",
+        level=logging.INFO,
     )
-    while True:
-        band.waitForNotifications(0.2)
+
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    dotenv.load_dotenv()
+
+    o = MiBand4(
+        mac_addr=os.getenv("MIBAND4_MAC_ADDR"),
+        auth_key=os.getenv("MIBAND4_AUTH_KEY"),
+        success_interval=int(os.getenv("MIBAND4_SUCCESS_INTERVAL")),
+        failure_interval=int(os.getenv("MIBAND4_FAILURE_INTERVAL")),
+        dbtable_activity=os.getenv("MIBAND4_INFLUXDB_MEASUREMENT_ACTIVITY"),
+        dbtable_device=os.getenv("MIBAND4_INFLUXDB_MEASUREMENT_DEVICE"),
+        dbhost=os.getenv("INFLUXDB_HOST"),
+        dbuser=os.getenv("INFLUXDB_USER"),
+        dbpass=os.getenv("INFLUXDB_PASS"),
+        dbname=os.getenv("INFLUXDB_NAME"),
+    )
+    o.Run()
 
 
 if __name__ == "__main__":
