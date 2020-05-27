@@ -33,11 +33,9 @@ class MH_Z19B:
 
     @staticmethod
     def CRC8(b: bytes) -> int:
-        crc = sum(b[1:8])
-        crc %= 256
-        crc = ~crc & 0xFF
-        crc += 1
-        return crc
+        crc = sum(b[1:8]) & 0xFF
+        crc = (~crc) + 1
+        return crc & 0xFF
 
     def _read_co2(self) -> int:
         # Code adapted from: https://www.circuits.dk/testing-mh-z19-ndir-co2-sensor-module/

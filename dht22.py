@@ -36,6 +36,10 @@ class DHT22:
 
     def _report(self):
         h, t = self._read()
+        if h > 100:
+            print(f"Bad read of humidity: {h}. Skip")
+            return
+
         data = f"{self._measurement} temperature={t},humidity={h}"
         r = self._session.post(self._url, data=data)
         try:

@@ -19,7 +19,7 @@ fi
 cat > "$service_path" <<EOM
 [Unit]
 Description=Edgedev $1
-After=network-online.target
+After=network-online.target systemd-timesyncd.service
 Requires=network-online.target
 
 [Service]
